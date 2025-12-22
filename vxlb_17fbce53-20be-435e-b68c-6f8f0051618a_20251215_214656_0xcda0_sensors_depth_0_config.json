@@ -1,0 +1,17 @@
+{
+  "roi": [
+    74,
+    140,
+    76,
+    35
+  ],
+  "min_depth_m": 0.3,
+  "max_depth_m": 8.0,
+  "window_size": 10,
+  "min_edge_strength_m": 0.2,
+  "smoothing_window": 5,
+  "min_event_gap_frames": 80,
+  "min_valid_pixels_pct": 10.0,
+  "frame_rate_hz": 10.0,
+  "rotate": 90
+}

@@ -1,0 +1,27 @@
+# Bag files (large data)
+bags/
+*.mcap
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config and labels (user-specific, but can be committed if desired)
+# *_config.json
+# *_labels.json

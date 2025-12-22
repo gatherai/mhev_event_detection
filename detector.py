@@ -27,6 +27,15 @@ class PalletEvent:
 
 
 @dataclass
+class FilterStats:
+    """Statistics about what each filter rejected."""
+    spike_rejected: int = 0           # PICK_UP→DROP_OFF pairs rejected
+    dwell_rejected: int = 0           # Events rejected for insufficient dwell time
+    variance_rejected: int = 0        # Events rejected for high variance
+    baseline_rejected: int = 0        # Events rejected for returning to baseline
+
+
+@dataclass
 class DetectorConfig:
     """All tunable detection parameters."""
     # ROI definition (x, y, width, height in pixels)
@@ -50,6 +59,31 @@ class DetectorConfig:
 
     frame_rate_hz: float = 10.0
 
+    # Anti-false-positive filters (for transient occlusions like people walking through)
+    # These filters are OFF by default - enable and tune for environments with pedestrian traffic
+    #
+    # Filter 1: Spike detection - reject PICK_UP→DROP_OFF pairs within short window
+    # A person walking through creates a brief dip: PICK_UP (depth drops) → DROP_OFF (returns)
+    spike_reject_window_frames: int = 30  # ~3 sec at 10Hz - reject if drop follows pick within this
+    enable_spike_filter: bool = False     # OFF by default
+
+    # Filter 2: Minimum dwell time - new depth must persist after transition
+    # NOTE: Edge detection already handles this via window averaging
+    min_dwell_frames: int = 10            # ~1 sec at 10Hz
+    dwell_tolerance_m: float = 0.5        # More permissive - depth changes during transitions
+    enable_dwell_filter: bool = False     # OFF by default
+
+    # Filter 3: Depth variance check - reject high variance (curved person vs flat pallet)
+    # NOTE: DROP_OFF events naturally have higher variance during transition
+    max_event_variance_m2: float = 1.0    # Permissive threshold (pallet variance ~0.01-0.02)
+    enable_variance_filter: bool = False  # OFF by default
+
+    # Filter 4: Return-to-baseline - reject if depth returns to original
+    # If depth returns to pre-event level after the event, likely a transient
+    baseline_check_frames: int = 50       # Check this many frames after event (~5 sec)
+    baseline_return_threshold_m: float = 0.2  # If depth returns within this of pre-event, reject
+    enable_baseline_filter: bool = False  # OFF by default
+
     def to_dict(self) -> dict:
         """Export config to dictionary for JSON serialization."""
         return {
@@ -62,6 +96,17 @@ class DetectorConfig:
             "min_event_gap_frames": self.min_event_gap_frames,
             "min_valid_pixels_pct": self.min_valid_pixels_pct,
             "frame_rate_hz": self.frame_rate_hz,
+            # Anti-false-positive filter settings
+            "spike_reject_window_frames": self.spike_reject_window_frames,
+            "enable_spike_filter": self.enable_spike_filter,
+            "min_dwell_frames": self.min_dwell_frames,
+            "dwell_tolerance_m": self.dwell_tolerance_m,
+            "enable_dwell_filter": self.enable_dwell_filter,
+            "max_event_variance_m2": self.max_event_variance_m2,
+            "enable_variance_filter": self.enable_variance_filter,
+            "baseline_check_frames": self.baseline_check_frames,
+            "baseline_return_threshold_m": self.baseline_return_threshold_m,
+            "enable_baseline_filter": self.enable_baseline_filter,
         }
 
     @classmethod
@@ -73,7 +118,12 @@ class DetectorConfig:
 
         for key in ["min_depth_m", "max_depth_m", "window_size", "min_edge_strength_m",
                     "smoothing_window", "min_event_gap_frames", "min_valid_pixels_pct",
-                    "frame_rate_hz"]:
+                    "frame_rate_hz",
+                    # Anti-false-positive filter settings
+                    "spike_reject_window_frames", "enable_spike_filter",
+                    "min_dwell_frames", "dwell_tolerance_m", "enable_dwell_filter",
+                    "max_event_variance_m2", "enable_variance_filter",
+                    "baseline_check_frames", "baseline_return_threshold_m", "enable_baseline_filter"]:
             if key in d:
                 setattr(config, key, d[key])
 
@@ -90,10 +140,12 @@ class EdgeDetector:
     3. Compute edge signal: difference between after-window and before-window
     4. Find peaks in edge signal that exceed threshold
     5. Classify: negative edge = PICK_UP, positive edge = DROP_OFF
+    6. Apply anti-false-positive filters (spike, dwell, variance, baseline)
     """
 
     def __init__(self, config: DetectorConfig = None):
         self.config = config or DetectorConfig()
+        self.filter_stats = FilterStats()  # Track what each filter rejected
 
     def extract_roi(self, depth_image: np.ndarray) -> np.ndarray:
         """Extract the region of interest from the depth image."""
@@ -146,16 +198,23 @@ class EdgeDetector:
         c = self.config
         n_frames = len(depth_frames)
 
-        # Step 1: Extract median depth for each frame
+        # Reset filter stats for this batch
+        self.filter_stats = FilterStats()
+
+        # Step 1: Extract median depth and variance for each frame
         depths = []
+        variances = []
         for frame in depth_frames:
             stats = self.compute_frame_stats(frame)
             if stats.valid_pixel_pct >= c.min_valid_pixels_pct:
                 depths.append(stats.median_depth_m)
+                variances.append(stats.variance_m)
             else:
                 depths.append(np.nan)
+                variances.append(np.nan)
 
         depths = np.array(depths)
+        variances = np.array(variances)
 
         # Step 2: Interpolate NaN values for continuity
         depths_interp = self._interpolate_nans(depths)
@@ -179,6 +238,9 @@ class EdgeDetector:
 
         # Step 5: Find events (peaks in edge signal)
         events = self._find_events(edge_signal, smoothed)
+
+        # Step 6: Apply anti-false-positive filters
+        events = self._apply_filters(events, smoothed, variances)
 
         return depths.tolist(), events
 
@@ -288,6 +350,209 @@ class EdgeDetector:
                 merged.append(event)
 
         return merged
+
+    def _apply_filters(self, events: List[PalletEvent], smoothed_depths: np.ndarray,
+                       variances: np.ndarray) -> List[PalletEvent]:
+        """
+        Apply anti-false-positive filters to detected events.
+
+        Filters (applied in order):
+        1. Spike filter: Reject PICK_UP→DROP_OFF pairs within short window
+        2. Variance filter: Reject events with high depth variance (curved person)
+        3. Dwell filter: Reject if new depth doesn't persist
+        4. Baseline filter: Reject if depth returns to pre-event level
+        """
+        if len(events) == 0:
+            return events
+
+        c = self.config
+        n_frames = len(smoothed_depths)
+
+        # Filter 1: Spike detection (PICK_UP→DROP_OFF pairs within short window)
+        if c.enable_spike_filter:
+            events = self._filter_spikes(events)
+
+        # Filter 2: Variance check (reject high variance = curved person)
+        if c.enable_variance_filter:
+            events = self._filter_by_variance(events, variances)
+
+        # Filter 3: Dwell time check (new depth must persist)
+        if c.enable_dwell_filter:
+            events = self._filter_by_dwell(events, smoothed_depths, n_frames)
+
+        # Filter 4: Baseline return check (reject if depth returns to original)
+        if c.enable_baseline_filter:
+            events = self._filter_by_baseline_return(events, smoothed_depths, n_frames)
+
+        return events
+
+    def _filter_spikes(self, events: List[PalletEvent]) -> List[PalletEvent]:
+        """
+        Filter 1: Reject PICK_UP→DROP_OFF pairs that occur within a short window.
+
+        A person walking through creates: PICK_UP (depth drops) → DROP_OFF (depth returns)
+        If these happen within spike_reject_window_frames, reject both.
+        """
+        if len(events) < 2:
+            return events
+
+        c = self.config
+        filtered = []
+        i = 0
+
+        while i < len(events):
+            event = events[i]
+
+            # Look ahead to see if this is part of a spike
+            if (i + 1 < len(events) and
+                event.event_type == "PICK_UP" and
+                events[i + 1].event_type == "DROP_OFF"):
+
+                gap = events[i + 1].frame_idx - event.frame_idx
+
+                if gap <= c.spike_reject_window_frames:
+                    # This is a spike (quick PICK_UP→DROP_OFF) - reject both
+                    self.filter_stats.spike_rejected += 2
+                    i += 2  # Skip both events
+                    continue
+
+            filtered.append(event)
+            i += 1
+
+        return filtered
+
+    def _filter_by_variance(self, events: List[PalletEvent],
+                            variances: np.ndarray) -> List[PalletEvent]:
+        """
+        Filter 2: Reject events where depth variance is too high.
+
+        A flat pallet has low variance, a curved person has high variance.
+        Check variance in a window around the event.
+        """
+        c = self.config
+        filtered = []
+        w = c.window_size
+
+        for event in events:
+            idx = event.frame_idx
+            # Get variance in window around event
+            start = max(0, idx - w)
+            end = min(len(variances), idx + w)
+            window_variances = variances[start:end]
+            valid_vars = window_variances[~np.isnan(window_variances)]
+
+            if len(valid_vars) == 0:
+                # No valid variance data, keep the event
+                filtered.append(event)
+                continue
+
+            mean_variance = np.mean(valid_vars)
+
+            if mean_variance <= c.max_event_variance_m2:
+                filtered.append(event)
+            else:
+                self.filter_stats.variance_rejected += 1
+
+        return filtered
+
+    def _filter_by_dwell(self, events: List[PalletEvent],
+                         smoothed_depths: np.ndarray, n_frames: int) -> List[PalletEvent]:
+        """
+        Filter 3: Reject events where the new depth doesn't persist (dwell).
+
+        After an event, the depth should stay at the new level for min_dwell_frames.
+        This rejects transient occlusions.
+        """
+        c = self.config
+        filtered = []
+
+        for event in events:
+            idx = event.frame_idx
+            event_depth = event.depth_m
+
+            # Check if depth stays stable after event
+            dwell_end = min(n_frames, idx + c.min_dwell_frames)
+            if dwell_end <= idx:
+                # Not enough frames after event, keep it
+                filtered.append(event)
+                continue
+
+            post_depths = smoothed_depths[idx:dwell_end]
+            valid_depths = post_depths[~np.isnan(post_depths)]
+
+            if len(valid_depths) == 0:
+                filtered.append(event)
+                continue
+
+            # Check if most frames stay within tolerance of event depth
+            within_tolerance = np.abs(valid_depths - event_depth) <= c.dwell_tolerance_m
+            dwell_ratio = np.sum(within_tolerance) / len(valid_depths)
+
+            if dwell_ratio >= 0.7:  # At least 70% of frames within tolerance
+                filtered.append(event)
+            else:
+                self.filter_stats.dwell_rejected += 1
+
+        return filtered
+
+    def _filter_by_baseline_return(self, events: List[PalletEvent],
+                                   smoothed_depths: np.ndarray, n_frames: int) -> List[PalletEvent]:
+        """
+        Filter 4: Reject events where depth returns to pre-event baseline.
+
+        If after an event the depth returns to what it was before, this was
+        likely a transient occlusion (person walking through), not a real event.
+        """
+        c = self.config
+        w = c.window_size
+        filtered = []
+
+        for event in events:
+            idx = event.frame_idx
+
+            # Get baseline (pre-event) depth
+            baseline_start = max(0, idx - w - c.window_size)
+            baseline_end = max(0, idx - w)
+            if baseline_end <= baseline_start:
+                filtered.append(event)
+                continue
+
+            baseline_depths = smoothed_depths[baseline_start:baseline_end]
+            valid_baseline = baseline_depths[~np.isnan(baseline_depths)]
+
+            if len(valid_baseline) == 0:
+                filtered.append(event)
+                continue
+
+            pre_event_depth = np.mean(valid_baseline)
+
+            # Check depth after the check window
+            check_start = idx + c.baseline_check_frames
+            check_end = min(n_frames, check_start + w)
+
+            if check_end <= check_start:
+                # Not enough frames to check, keep event
+                filtered.append(event)
+                continue
+
+            post_depths = smoothed_depths[check_start:check_end]
+            valid_post = post_depths[~np.isnan(post_depths)]
+
+            if len(valid_post) == 0:
+                filtered.append(event)
+                continue
+
+            post_event_depth = np.mean(valid_post)
+
+            # If depth returned to baseline, reject the event
+            returned_to_baseline = abs(post_event_depth - pre_event_depth) <= c.baseline_return_threshold_m
+
+            if not returned_to_baseline:
+                filtered.append(event)
+            else:
+                self.filter_stats.baseline_rejected += 1
+
+        return filtered
 
 
 # Keep old class name for compatibility

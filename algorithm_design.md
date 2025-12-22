@@ -127,6 +127,65 @@ def merge_consecutive_same_type(events):
 4. **Same-type merging** eliminates duplicates (can't pick up twice without dropping)
 5. **Keep last** strategy captures the final action (actual engagement, not approach)
 
+### Anti-False-Positive Filters (Optional)
+
+For environments with pedestrian traffic (people walking in front of camera), additional filters are available. These are **OFF by default** since edge detection already handles most cases well.
+
+#### Filter 1: Spike Detection
+Rejects PICK_UP→DROP_OFF pairs that occur within a short window.
+
+**Rationale:** A person walking through creates:
+1. PICK_UP event (depth drops as person enters)
+2. DROP_OFF event (depth returns as person leaves)
+
+If these happen within ~3 seconds, reject both as transient occlusion.
+
+```
+spike_reject_window_frames: 30  # ~3 sec at 10Hz
+```
+
+#### Filter 2: Baseline Return Check
+Rejects events where depth returns to pre-event level after the event.
+
+**Rationale:** Real pick-up/drop-off changes the depth permanently. If depth returns to original, it was a transient occlusion.
+
+```
+baseline_check_frames: 50        # Check 5 sec after event
+baseline_return_threshold_m: 0.2 # If within 0.2m of original, reject
+```
+
+#### Filter 3: Variance Check
+Rejects events with high depth variance in the ROI.
+
+**Rationale:** Flat pallet surface has low variance (~0.01-0.02 m²). Curved person has higher variance.
+
+**Note:** Less reliable because DROP_OFF events naturally have higher variance during transition.
+
+```
+max_event_variance_m2: 1.0  # Permissive to avoid false rejections
+```
+
+#### Filter 4: Dwell Time Check
+Requires depth to stay stable after event.
+
+**Note:** Less effective with edge detection since the edge point is in the middle of the transition, not at the stable end state.
+
+```
+min_dwell_frames: 10        # ~1 sec at 10Hz
+dwell_tolerance_m: 0.5      # Permissive tolerance
+```
+
+#### Recommended Filter Configuration
+
+For environments with pedestrian traffic:
+
+| Filter | Recommended | Notes |
+|--------|-------------|-------|
+| Spike | **Enable** | Most effective for person walk-through |
+| Baseline Return | **Enable** | Good secondary check |
+| Variance | Disable | High false rejection rate |
+| Dwell | Disable | Not compatible with edge detection |
+
 ---
 
 ## Approach 4: Hybrid (Proposed for Future)

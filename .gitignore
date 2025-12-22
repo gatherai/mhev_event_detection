@@ -25,3 +25,7 @@ Thumbs.db
 # Config and labels (user-specific, but can be committed if desired)
 # *_config.json
 # *_labels.json
+# Generated visualizations
+depth_timeline_plot.png
+depth_video_annotated.mp4
+depth_video_small.mp4

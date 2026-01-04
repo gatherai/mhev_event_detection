@@ -33,6 +33,8 @@ class FilterStats:
     dwell_rejected: int = 0           # Events rejected for insufficient dwell time
     variance_rejected: int = 0        # Events rejected for high variance
     baseline_rejected: int = 0        # Events rejected for returning to baseline
+    pre_stability_rejected: int = 0   # Events rejected for unstable depth before event
+    twoway_baseline_rejected: int = 0 # Events rejected for depth returning to pre-event level
 
 
 @dataclass
@@ -56,6 +58,7 @@ class DetectorConfig:
     # Event filtering
     min_event_gap_frames: int = 30     # Minimum frames between events (3 sec)
     min_valid_pixels_pct: float = 10.0 # Minimum valid pixels to use frame
+    max_event_distance_m: float = 5.0  # Only detect events when depth <= this (forklift must be close)
 
     frame_rate_hz: float = 10.0
 
@@ -84,6 +87,20 @@ class DetectorConfig:
     baseline_return_threshold_m: float = 0.2  # If depth returns within this of pre-event, reject
     enable_baseline_filter: bool = False  # OFF by default
 
+    # Filter 5: Pre-event stability - reject if depth was unstable before event
+    # Real events have stable depth beforehand; people suddenly appearing have no pre-stability
+    pre_event_check_frames: int = 30      # Check stability this many frames before event (~3 sec)
+    max_pre_event_variance_m2: float = 0.05  # Max variance before event (stable = low variance)
+    min_nan_block_for_stability: int = 20  # Long NaN block = stable state (pallet blocking sensor)
+    max_state_transitions: int = 3         # Max valid↔NaN transitions (more = flickering/unstable)
+    enable_pre_stability_filter: bool = False  # OFF by default
+
+    # Filter 6: Two-way baseline - reject if depth same before AND after event
+    # Transient occlusions: depth_before ≈ depth_after (person walks through, depth returns)
+    # Real pallets: depth_before ≠ depth_after (permanent change)
+    # Uses state comparison: NaN vs valid, or valid depth values
+    enable_twoway_baseline_filter: bool = False  # OFF by default
+
     def to_dict(self) -> dict:
         """Export config to dictionary for JSON serialization."""
         return {
@@ -95,6 +112,7 @@ class DetectorConfig:
             "smoothing_window": self.smoothing_window,
             "min_event_gap_frames": self.min_event_gap_frames,
             "min_valid_pixels_pct": self.min_valid_pixels_pct,
+            "max_event_distance_m": self.max_event_distance_m,
             "frame_rate_hz": self.frame_rate_hz,
             # Anti-false-positive filter settings
             "spike_reject_window_frames": self.spike_reject_window_frames,
@@ -107,6 +125,12 @@ class DetectorConfig:
             "baseline_check_frames": self.baseline_check_frames,
             "baseline_return_threshold_m": self.baseline_return_threshold_m,
             "enable_baseline_filter": self.enable_baseline_filter,
+            "pre_event_check_frames": self.pre_event_check_frames,
+            "max_pre_event_variance_m2": self.max_pre_event_variance_m2,
+            "min_nan_block_for_stability": self.min_nan_block_for_stability,
+            "max_state_transitions": self.max_state_transitions,
+            "enable_pre_stability_filter": self.enable_pre_stability_filter,
+            "enable_twoway_baseline_filter": self.enable_twoway_baseline_filter,
         }
 
     @classmethod
@@ -118,12 +142,14 @@ class DetectorConfig:
 
         for key in ["min_depth_m", "max_depth_m", "window_size", "min_edge_strength_m",
                     "smoothing_window", "min_event_gap_frames", "min_valid_pixels_pct",
-                    "frame_rate_hz",
+                    "max_event_distance_m", "frame_rate_hz",
                     # Anti-false-positive filter settings
                     "spike_reject_window_frames", "enable_spike_filter",
                     "min_dwell_frames", "dwell_tolerance_m", "enable_dwell_filter",
                     "max_event_variance_m2", "enable_variance_filter",
-                    "baseline_check_frames", "baseline_return_threshold_m", "enable_baseline_filter"]:
+                    "baseline_check_frames", "baseline_return_threshold_m", "enable_baseline_filter",
+                    "pre_event_check_frames", "max_pre_event_variance_m2", "min_nan_block_for_stability",
+                    "max_state_transitions", "enable_pre_stability_filter", "enable_twoway_baseline_filter"]:
             if key in d:
                 setattr(config, key, d[key])
 
@@ -270,6 +296,10 @@ class EdgeDetector:
             if abs(edge) < c.min_edge_strength_m:
                 continue
 
+            # Filter: only detect events when forklift is close
+            if smoothed_depths[i] > c.max_event_distance_m:
+                continue
+
             # Check if this is a local extremum (peak or trough)
             is_peak = True
             search_range = min(5, w // 2)  # Look +/- 5 frames
@@ -361,6 +391,8 @@ class EdgeDetector:
         2. Variance filter: Reject events with high depth variance (curved person)
         3. Dwell filter: Reject if new depth doesn't persist
         4. Baseline filter: Reject if depth returns to pre-event level
+        5. Pre-stability filter: Reject if depth was unstable before event
+        6. Two-way baseline filter: Reject if depth before ≈ depth after (transient)
         """
         if len(events) == 0:
             return events
@@ -383,6 +415,14 @@ class EdgeDetector:
         # Filter 4: Baseline return check (reject if depth returns to original)
         if c.enable_baseline_filter:
             events = self._filter_by_baseline_return(events, smoothed_depths, n_frames)
+
+        # Filter 5: Pre-event stability check (reject if depth unstable before event)
+        if c.enable_pre_stability_filter:
+            events = self._filter_by_pre_stability(events, smoothed_depths, n_frames)
+
+        # Filter 6: Two-way baseline check (reject if depth_before ≈ depth_after)
+        if c.enable_twoway_baseline_filter:
+            events = self._filter_by_twoway_baseline(events, smoothed_depths, n_frames)
 
         return events
 
@@ -551,6 +591,183 @@ class EdgeDetector:
                 filtered.append(event)
             else:
                 self.filter_stats.baseline_rejected += 1
+
+        return filtered
+
+    def _is_window_stable(self, window: np.ndarray, config) -> bool:
+        """
+        Check if a window represents a stable state.
+        Stable = either low depth variance OR long NaN block.
+        """
+        nan_mask = np.isnan(window)
+        nan_ratio = np.sum(nan_mask) / len(window)
+
+        # Case 1: Mostly NaN (>70%)
+        if nan_ratio > 0.7:
+            # Check if it's a consistent NaN block (not flickering)
+            nan_block_length = self._longest_consecutive_block(nan_mask)
+            return nan_block_length >= config.min_nan_block_for_stability
+
+        # Case 2: Mostly valid depth (>70%)
+        elif nan_ratio < 0.3:
+            valid_values = window[~nan_mask]
+            if len(valid_values) < 5:
+                return False
+            variance = np.var(valid_values)
+            return variance <= config.max_pre_event_variance_m2
+
+        # Case 3: Mixed (30-70% NaN) - check for flickering
+        else:
+            # Count transitions between valid and NaN
+            transitions = self._count_state_transitions(nan_mask)
+            return transitions <= config.max_state_transitions
+
+    def _longest_consecutive_block(self, mask: np.ndarray) -> int:
+        """Find the longest consecutive True block in a boolean array."""
+        if len(mask) == 0:
+            return 0
+
+        max_length = 0
+        current_length = 0
+
+        for val in mask:
+            if val:
+                current_length += 1
+                max_length = max(max_length, current_length)
+            else:
+                current_length = 0
+
+        return max_length
+
+    def _count_state_transitions(self, mask: np.ndarray) -> int:
+        """Count transitions between True and False in a boolean array."""
+        if len(mask) <= 1:
+            return 0
+
+        transitions = 0
+        for i in range(1, len(mask)):
+            if mask[i] != mask[i-1]:
+                transitions += 1
+
+        return transitions
+
+    def _filter_by_pre_stability(self, events: List[PalletEvent],
+                                  smoothed_depths: np.ndarray, n_frames: int) -> List[PalletEvent]:
+        """
+        Filter 5: Reject events where depth was unstable before the event.
+
+        Real pallet events have stable depth beforehand (empty floor, then forklift approaches).
+        Transient occlusions (people) appear suddenly with no pre-stability.
+
+        Considers both valid depth stability AND long NaN blocks as stable states.
+        """
+        c = self.config
+        filtered = []
+
+        for event in events:
+            idx = event.frame_idx
+
+            # Get pre-event window (avoid the edge detection window itself)
+            pre_start = max(0, idx - c.pre_event_check_frames - c.window_size)
+            pre_end = max(0, idx - c.window_size)
+
+            if pre_end <= pre_start:
+                # Not enough frames before event, keep it
+                filtered.append(event)
+                continue
+
+            pre_window = smoothed_depths[pre_start:pre_end]
+
+            # Check if pre-event state was stable (valid depth OR long NaN block)
+            is_stable = self._is_window_stable(pre_window, c)
+
+            if is_stable:
+                filtered.append(event)
+            else:
+                self.filter_stats.pre_stability_rejected += 1
+
+        return filtered
+
+    def _classify_window_state(self, window: np.ndarray) -> tuple:
+        """
+        Classify window as NaN-state or valid-state with mean depth.
+        Returns: (is_nan_state, mean_depth)
+        """
+        nan_mask = np.isnan(window)
+        nan_ratio = np.sum(nan_mask) / len(window)
+
+        # Mostly NaN (>70%) = NaN state
+        if nan_ratio > 0.7:
+            return (True, np.nan)
+
+        # Mostly valid (>70%) = valid state with mean depth
+        elif nan_ratio < 0.3:
+            valid_values = window[~nan_mask]
+            if len(valid_values) >= 5:
+                return (False, np.mean(valid_values))
+
+        # Mixed/uncertain - treat as valid if possible
+        valid_values = window[~nan_mask]
+        if len(valid_values) >= 5:
+            return (False, np.mean(valid_values))
+
+        return (True, np.nan)
+
+    def _filter_by_twoway_baseline(self, events: List[PalletEvent],
+                                    smoothed_depths: np.ndarray, n_frames: int) -> List[PalletEvent]:
+        """
+        Filter 6: Reject events where state before ≈ state after (transient occlusion).
+
+        For real pallet events: state changes permanently (before ≠ after)
+        For transient occlusions (people): state returns to original (before ≈ after)
+
+        Compares states: NaN vs valid, or valid depth values.
+        """
+        c = self.config
+        w = c.window_size
+        filtered = []
+
+        for event in events:
+            idx = event.frame_idx
+
+            # Get baseline BEFORE event (well before the edge window)
+            before_start = max(0, idx - c.baseline_check_frames - w)
+            before_end = max(0, idx - w - 10)  # 10 frame buffer from edge
+
+            # Get baseline AFTER event (well after the edge window)
+            after_start = min(n_frames, idx + w + 10)  # 10 frame buffer
+            after_end = min(n_frames, idx + c.baseline_check_frames + w)
+
+            # Need enough frames on both sides
+            if before_end <= before_start or after_end <= after_start:
+                filtered.append(event)
+                continue
+
+            before_window = smoothed_depths[before_start:before_end]
+            after_window = smoothed_depths[after_start:after_end]
+
+            # Classify states
+            before_is_nan, before_depth = self._classify_window_state(before_window)
+            after_is_nan, after_depth = self._classify_window_state(after_window)
+
+            # Compare states
+            state_returned = False
+
+            if before_is_nan and after_is_nan:
+                # Both NaN states → no change → transient
+                state_returned = True
+
+            elif not before_is_nan and not after_is_nan:
+                # Both valid → compare depth values
+                if abs(after_depth - before_depth) <= c.baseline_return_threshold_m:
+                    state_returned = True
+
+            # else: one NaN, one valid → state changed → real event
+
+            if state_returned:
+                self.filter_stats.twoway_baseline_rejected += 1
+            else:
+                filtered.append(event)
 
         return filtered
 

@@ -211,15 +211,17 @@ class EdgeDetector:
             valid_pixel_pct=valid_pct
         )
 
-    def process_batch(self, depth_frames: List[np.ndarray]) -> Tuple[List[float], List[PalletEvent]]:
+    def process_batch(self, depth_frames: List[np.ndarray], return_diagnostics: bool = False) -> Tuple[List[float], List[PalletEvent], dict]:
         """
         Process a batch of depth frames and detect all events.
 
         Args:
             depth_frames: List of depth images (numpy arrays)
+            return_diagnostics: If True, return edge signal and rejected candidates
 
         Returns:
-            Tuple of (depth_history, detected_events)
+            Tuple of (depth_history, detected_events, diagnostics_dict)
+            diagnostics_dict contains: edge_signal, rejected_candidates, filter_stats
         """
         c = self.config
         n_frames = len(depth_frames)
@@ -263,12 +265,25 @@ class EdgeDetector:
                 edge_signal[i] = after - before
 
         # Step 5: Find events (peaks in edge signal)
-        events = self._find_events(edge_signal, smoothed)
+        events_before_filters = self._find_events(edge_signal, smoothed)
 
         # Step 6: Apply anti-false-positive filters
-        events = self._apply_filters(events, smoothed, variances)
+        events = self._apply_filters(events_before_filters, smoothed, variances)
 
-        return depths.tolist(), events
+        # Prepare diagnostics
+        diagnostics = {}
+        if return_diagnostics:
+            # Rejected candidates = events that didn't pass filters
+            rejected_candidates = [e for e in events_before_filters if e not in events]
+
+            diagnostics = {
+                'edge_signal': edge_signal.tolist(),
+                'smoothed_depths': smoothed.tolist(),
+                'rejected_candidates': rejected_candidates,
+                'filter_stats': self.filter_stats
+            }
+
+        return depths.tolist(), events, diagnostics
 
     def _interpolate_nans(self, arr: np.ndarray) -> np.ndarray:
         """Interpolate NaN values in array."""

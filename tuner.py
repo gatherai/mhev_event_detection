@@ -178,6 +178,12 @@ class InteractiveTuner:
         # History for timeline
         self.depth_history = []
         self.event_markers = []  # [(frame_idx, event_type), ...] - detected events
+        self.event_objects = []  # Full PalletEvent objects for annotations
+
+        # Diagnostics data
+        self.edge_signal = []
+        self.rejected_candidates = []
+        self.filter_stats = None
 
         # Manual labels for ground truth
         self.labels = []  # [(frame_idx, event_type), ...]
@@ -197,16 +203,23 @@ class InteractiveTuner:
         self.fig = plt.figure(figsize=(14, 10))
         self.fig.canvas.manager.set_window_title('MHE-V Pallet Event Detection Tuner')
 
-        # Main axes layout
+        # Main axes layout (3 plots)
         # Top left: Depth image with ROI
-        self.ax_depth = self.fig.add_axes([0.05, 0.45, 0.45, 0.5])
+        self.ax_depth = self.fig.add_axes([0.05, 0.55, 0.35, 0.4])
         self.ax_depth.set_title('Depth Image (draw ROI)')
 
         # Top right: Timeline (with zoom/pan support)
-        self.ax_timeline = self.fig.add_axes([0.55, 0.45, 0.4, 0.5])
-        self.ax_timeline.set_title('Median Depth in ROI (scroll to zoom, drag to pan)')
-        self.ax_timeline.set_xlabel('Frame')
+        self.ax_timeline = self.fig.add_axes([0.45, 0.725, 0.5, 0.225])
+        self.ax_timeline.set_title('Median Depth in ROI (scroll=zoom, z=reset)')
         self.ax_timeline.set_ylabel('Depth (m)')
+        self.ax_timeline.tick_params(labelbottom=False)  # Hide x labels (shared with edge plot)
+
+        # Middle right: Edge Signal Plot (NEW!)
+        self.ax_edge = self.fig.add_axes([0.45, 0.475, 0.5, 0.225])
+        self.ax_edge.set_title('Edge Detection Signal (after - before)')
+        self.ax_edge.set_xlabel('Frame')
+        self.ax_edge.set_ylabel('Edge (m)')
+        self.ax_edge.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
 
         # Enable interactive zoom/pan on timeline
         self.timeline_xlim = None  # Track manual zoom state
@@ -217,14 +230,12 @@ class InteractiveTuner:
         self.last_label_move_time = 0
         self.label_move_cooldown = 0.15  # 150ms minimum between moves
 
-        # Slider area - two columns to fit all parameters
-        slider_height = 0.018
-        slider_spacing = 0.028
+        # Slider area - Core parameters only (space saving!)
+        slider_height = 0.022
+        slider_spacing = 0.035
 
-        # Left column - main detection parameters
-        left_col_x = 0.08
-        left_col_width = 0.18
-        left_sliders = [
+        # Core detection parameters (keep as sliders for easy tuning)
+        core_sliders = [
             ('min_edge_strength_m', 'Edge Strength (m)', 0.1, 1.0, None),
             ('window_size', 'Window (frames)', 5, 30, None),
             ('smoothing_window', 'Smoothing', 1, 15, None),
@@ -233,33 +244,13 @@ class InteractiveTuner:
             ('max_event_distance_m', 'Max Dist (m)', 0.5, 5.0, None),
         ]
 
-        # Right column - filter parameters
-        right_col_x = 0.30
-        right_col_width = 0.18
-        right_sliders = [
-            ('enable_spike_filter', 'Spike Filter', 0, 1, 1),
-            ('spike_reject_window_frames', 'Spike Win (f)', 10, 100, None),
-            ('enable_dwell_filter', 'Dwell Filter', 0, 1, 1),
-            ('min_dwell_frames', 'Dwell (f)', 5, 30, None),
-            ('dwell_tolerance_m', 'Dwell Tol (m)', 0.1, 2.0, None),
-            ('enable_variance_filter', 'Var Filter', 0, 1, 1),
-            ('max_event_variance_m2', 'Max Var (m²)', 0.1, 5.0, None),
-            ('enable_baseline_filter', 'Base Filter', 0, 1, 1),
-            ('baseline_check_frames', 'Base Chk (f)', 20, 100, None),
-            ('baseline_return_threshold_m', 'Base Thr (m)', 0.1, 1.0, None),
-            ('enable_pre_stability_filter', 'Pre-Stab Filter', 0, 1, 1),
-            ('pre_event_check_frames', 'Pre-Stab (f)', 10, 100, None),
-            ('max_pre_event_variance_m2', 'Pre-Var (m²)', 0.01, 0.5, None),
-            ('min_nan_block_for_stability', 'NaN Block (f)', 5, 50, None),
-            ('max_state_transitions', 'Max Transit', 1, 10, None),
-            ('enable_twoway_baseline_filter', 'TwoWay Base', 0, 1, 1),
-        ]
-
         self.sliders = {}
 
-        # Create left column sliders
-        for i, (param, label, vmin, vmax, valstep) in enumerate(left_sliders):
-            ax = self.fig.add_axes([left_col_x, 0.40 - i * slider_spacing, left_col_width, slider_height])
+        # Create core parameter sliders (left side)
+        slider_x = 0.08
+        slider_width = 0.25
+        for i, (param, label, vmin, vmax, valstep) in enumerate(core_sliders):
+            ax = self.fig.add_axes([slider_x, 0.40 - i * slider_spacing, slider_width, slider_height])
             initial_val = getattr(self.config, param, vmin)
             if isinstance(initial_val, bool):
                 initial_val = 1 if initial_val else 0
@@ -267,15 +258,52 @@ class InteractiveTuner:
             slider.on_changed(self._make_slider_callback(param))
             self.sliders[param] = slider
 
-        # Create right column sliders
-        for i, (param, label, vmin, vmax, valstep) in enumerate(right_sliders):
-            ax = self.fig.add_axes([right_col_x, 0.40 - i * slider_spacing, right_col_width, slider_height])
-            initial_val = getattr(self.config, param, vmin)
+        # Filter parameters as compact TextBox fields (right side) - SPACE SAVING!
+        filter_params_y_start = 0.43
+        textbox_height = 0.02
+        textbox_spacing = 0.025
+        textbox_x = 0.38
+        label_x = 0.35
+        textbox_width = 0.06
+
+        filter_params = [
+            ('enable_spike_filter', 'Spike'),
+            ('spike_reject_window_frames', 'Spike Win'),
+            ('enable_dwell_filter', 'Dwell'),
+            ('min_dwell_frames', 'Dwell Fr'),
+            ('dwell_tolerance_m', 'Dwell Tol'),
+            ('enable_variance_filter', 'Variance'),
+            ('max_event_variance_m2', 'Max Var'),
+            ('enable_baseline_filter', 'Baseline'),
+            ('baseline_check_frames', 'Base Fr'),
+            ('baseline_return_threshold_m', 'Base Thr'),
+            ('enable_pre_stability_filter', 'PreStab'),
+            ('pre_event_check_frames', 'PreStab Fr'),
+            ('max_pre_event_variance_m2', 'PreVar'),
+            ('min_nan_block_for_stability', 'NaN Blk'),
+            ('max_state_transitions', 'MaxTrans'),
+            ('enable_twoway_baseline_filter', '2Way Base'),
+        ]
+
+        self.filter_textboxes = {}
+
+        for i, (param, label) in enumerate(filter_params):
+            # Add label
+            ax_label = self.fig.add_axes([label_x, filter_params_y_start - i * textbox_spacing, 0.02, textbox_height])
+            ax_label.axis('off')
+            ax_label.text(0, 0.5, label + ':', fontsize=7, ha='right', va='center')
+
+            # Add textbox
+            ax = self.fig.add_axes([textbox_x, filter_params_y_start - i * textbox_spacing, textbox_width, textbox_height])
+            initial_val = getattr(self.config, param)
             if isinstance(initial_val, bool):
-                initial_val = 1 if initial_val else 0
-            slider = Slider(ax, label, vmin, vmax, valinit=initial_val, valstep=valstep)
-            slider.on_changed(self._make_slider_callback(param))
-            self.sliders[param] = slider
+                initial_val = '1' if initial_val else '0'
+            else:
+                initial_val = str(initial_val)
+
+            textbox = TextBox(ax, '', initial=initial_val, color='lightgray', hovercolor='lightyellow')
+            textbox.on_submit(self._make_textbox_callback(param))
+            self.filter_textboxes[param] = textbox
 
         # Frame slider and textbox
         ax_frame = self.fig.add_axes([0.55, 0.35, 0.25, slider_height])
@@ -393,6 +421,38 @@ class InteractiveTuner:
             setattr(self.config, param, val)
             self._process_all_frames()
             self._update_display()
+        return callback
+
+    def _make_textbox_callback(self, param: str):
+        """Create a callback function for a textbox."""
+        def callback(text):
+            try:
+                # Integer parameters
+                if param in ['smoothing_window', 'window_size', 'min_event_gap_frames',
+                            'spike_reject_window_frames', 'min_dwell_frames', 'baseline_check_frames',
+                            'pre_event_check_frames', 'min_nan_block_for_stability', 'max_state_transitions']:
+                    val = int(float(text))  # Allow "10.0" -> 10
+                # Boolean parameters (0=False, 1=True)
+                elif param in ['enable_spike_filter', 'enable_dwell_filter',
+                              'enable_variance_filter', 'enable_baseline_filter',
+                              'enable_pre_stability_filter', 'enable_twoway_baseline_filter']:
+                    val = bool(int(float(text)))
+                # Float parameters
+                else:
+                    val = float(text)
+
+                setattr(self.config, param, val)
+                self._process_all_frames()
+                self._update_display()
+                print(f"✓ Updated {param} = {val}")
+            except ValueError:
+                print(f"⚠️  Invalid value for {param}: '{text}'")
+                # Reset to current config value
+                current_val = getattr(self.config, param)
+                if isinstance(current_val, bool):
+                    self.filter_textboxes[param].set_val('1' if current_val else '0')
+                else:
+                    self.filter_textboxes[param].set_val(str(current_val))
         return callback
 
     def _on_frame_change(self, val):
@@ -861,8 +921,8 @@ class InteractiveTuner:
             print(f"Advanced 200 frames to {self.current_frame}")
 
     def _on_scroll(self, event):
-        """Handle scroll wheel for zoom on timeline."""
-        if event.inaxes != self.ax_timeline:
+        """Handle scroll wheel for zoom on timeline and edge plot."""
+        if event.inaxes not in [self.ax_timeline, self.ax_edge]:
             return
 
         # Get current xlim
@@ -901,7 +961,7 @@ class InteractiveTuner:
 
     def _on_mouse_press(self, event):
         """Handle mouse button press for panning."""
-        if event.inaxes == self.ax_timeline and event.button == 1:  # Left click
+        if event.inaxes in [self.ax_timeline, self.ax_edge] and event.button == 1:  # Left click
             self.pan_start = event.xdata
 
     def _on_mouse_release(self, event):
@@ -911,7 +971,7 @@ class InteractiveTuner:
 
     def _on_mouse_move(self, event):
         """Handle mouse motion for panning."""
-        if self.pan_start is None or event.inaxes != self.ax_timeline:
+        if self.pan_start is None or event.inaxes not in [self.ax_timeline, self.ax_edge]:
             return
 
         if event.xdata is None:
@@ -950,13 +1010,21 @@ class InteractiveTuner:
         # Get all depth frames
         depth_frames = [self.reader[i][0] for i in range(len(self.reader))]
 
-        # Batch process
-        self.depth_history, events = self.detector.process_batch(depth_frames)
+        # Batch process with diagnostics
+        self.depth_history, events, diagnostics = self.detector.process_batch(depth_frames, return_diagnostics=True)
 
-        # Convert events to (frame_idx, event_type) tuples
+        # Store full event objects
+        self.event_objects = events
+
+        # Convert events to (frame_idx, event_type) tuples for compatibility
         self.event_markers = [(e.frame_idx, e.event_type) for e in events]
 
-        print(f"Detected {len(self.event_markers)} events")
+        # Store diagnostics
+        self.edge_signal = diagnostics.get('edge_signal', [])
+        self.rejected_candidates = diagnostics.get('rejected_candidates', [])
+        self.filter_stats = diagnostics.get('filter_stats', None)
+
+        print(f"Detected {len(self.event_markers)} events, {len(self.rejected_candidates)} rejected")
 
     def _update_display(self):
         """Update all display elements."""
@@ -973,25 +1041,66 @@ class InteractiveTuner:
         # Update timeline
         self.ax_timeline.clear()
         self.ax_timeline.set_title('Median Depth in ROI (scroll=zoom, z=reset)')
-        self.ax_timeline.set_xlabel('Frame')
         self.ax_timeline.set_ylabel('Depth (m)')
+        self.ax_timeline.tick_params(labelbottom=False)  # Hide x labels (shared with edge plot)
+
+        # Update edge signal plot (NEW!)
+        self.ax_edge.clear()
+        self.ax_edge.set_title('Edge Detection Signal (after - before)')
+        self.ax_edge.set_xlabel('Frame')
+        self.ax_edge.set_ylabel('Edge (m)')
+        self.ax_edge.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
 
         if self.depth_history:
             frames = range(len(self.depth_history))
-            self.ax_timeline.plot(frames, self.depth_history, 'b-', label='Depth')
+            self.ax_timeline.plot(frames, self.depth_history, 'b-', label='Depth', linewidth=1)
 
-            # Mark predicted events (dotted vertical lines)
-            pickup_plotted = False
-            dropoff_plotted = False
-            for frame_idx, event_type in self.event_markers:
-                if event_type == 'PICK_UP':
-                    self.ax_timeline.axvline(x=frame_idx, color='green', linestyle='--',
-                                              alpha=0.8, linewidth=1.5)
-                    pickup_plotted = True
-                else:
-                    self.ax_timeline.axvline(x=frame_idx, color='orange', linestyle='--',
-                                              alpha=0.8, linewidth=1.5)
-                    dropoff_plotted = True
+            # Plot edge signal (NEW!)
+            if self.edge_signal:
+                self.ax_edge.plot(frames, self.edge_signal, 'purple', linewidth=1, alpha=0.7, label='Edge Signal')
+
+                # Show threshold lines
+                self.ax_edge.axhline(y=self.config.min_edge_strength_m, color='red', linestyle='--',
+                                    alpha=0.5, linewidth=1, label=f'Threshold (±{self.config.min_edge_strength_m:.2f}m)')
+                self.ax_edge.axhline(y=-self.config.min_edge_strength_m, color='red', linestyle='--', alpha=0.5, linewidth=1)
+
+            # Mark REJECTED candidates (NEW! - Visual Enhancement #4)
+            for event in self.rejected_candidates:
+                frame_idx = event.frame_idx
+                edge_val = self.edge_signal[frame_idx] if frame_idx < len(self.edge_signal) else 0
+
+                # Mark on edge signal plot
+                self.ax_edge.plot(frame_idx, edge_val, 'x', color='gray', markersize=8,
+                                markeredgewidth=2, alpha=0.6, zorder=3)
+
+                # Mark on timeline
+                depth_at_frame = self.depth_history[frame_idx] if frame_idx < len(self.depth_history) else 0
+                self.ax_timeline.plot(frame_idx, depth_at_frame, 'x', color='gray',
+                                    markersize=8, markeredgewidth=2, alpha=0.6, zorder=3)
+
+            # Mark predicted events with ANNOTATIONS (NEW! - Visual Enhancement #3)
+            for event_obj in self.event_objects:
+                frame_idx = event_obj.frame_idx
+                event_type = event_obj.event_type
+                color = 'green' if event_type == 'PICK_UP' else 'orange'
+
+                # Mark on timeline
+                self.ax_timeline.axvline(x=frame_idx, color=color, linestyle='--',
+                                          alpha=0.8, linewidth=1.5)
+
+                # Mark on edge signal plot
+                edge_val = self.edge_signal[frame_idx] if frame_idx < len(self.edge_signal) else 0
+                self.ax_edge.axvline(x=frame_idx, color=color, linestyle='--',
+                                    alpha=0.8, linewidth=1.5)
+                self.ax_edge.plot(frame_idx, edge_val, 'o', color=color, markersize=6, zorder=4)
+
+                # Add annotation showing edge strength (NEW! - Visual Enhancement #3)
+                annotation = f"{event_obj.edge_strength:.2f}m"
+                self.ax_edge.annotate(annotation, xy=(frame_idx, edge_val),
+                                    xytext=(0, 10 if edge_val > 0 else -15),
+                                    textcoords='offset points', fontsize=6,
+                                    color=color, fontweight='bold',
+                                    ha='center', alpha=0.9)
 
             # Mark manual labels (bold triangles on the depth line)
             for frame_idx, event_type in self.labels:
@@ -1001,20 +1110,27 @@ class InteractiveTuner:
                 self.ax_timeline.plot(frame_idx, depth_at_frame, marker, color=color,
                                       markersize=14, markeredgecolor='black', markeredgewidth=1.5, zorder=5)
 
-            # Current frame marker
+            # Current frame marker (on both plots)
             self.ax_timeline.axvline(x=self.current_frame, color='black',
                                       linestyle='-', linewidth=2, alpha=0.7)
+            self.ax_edge.axvline(x=self.current_frame, color='black',
+                                linestyle='-', linewidth=2, alpha=0.7)
 
             # Legend with all elements
             from matplotlib.lines import Line2D
             legend_elements = [
                 Line2D([0], [0], color='b', linewidth=2, label='Depth'),
-                Line2D([0], [0], color='green', linestyle='--', linewidth=1.5, label=f'Pred: Pick-up ({sum(1 for _, t in self.event_markers if t == "PICK_UP")})'),
-                Line2D([0], [0], color='orange', linestyle='--', linewidth=1.5, label=f'Pred: Drop-off ({sum(1 for _, t in self.event_markers if t == "DROP_OFF")})'),
-                Line2D([0], [0], marker='^', color='green', linestyle='', markersize=10, label=f'Label: Pick-up ({sum(1 for _, t in self.labels if t == "PICK_UP")})'),
-                Line2D([0], [0], marker='v', color='red', linestyle='', markersize=10, label=f'Label: Drop-off ({sum(1 for _, t in self.labels if t == "DROP_OFF")})'),
+                Line2D([0], [0], color='green', linestyle='--', linewidth=1.5, label=f'Pred: Pick ({sum(1 for _, t in self.event_markers if t == "PICK_UP")})'),
+                Line2D([0], [0], color='orange', linestyle='--', linewidth=1.5, label=f'Pred: Drop ({sum(1 for _, t in self.event_markers if t == "DROP_OFF")})'),
+                Line2D([0], [0], marker='^', color='green', linestyle='', markersize=8, label=f'Label: Pick ({sum(1 for _, t in self.labels if t == "PICK_UP")})'),
+                Line2D([0], [0], marker='v', color='red', linestyle='', markersize=8, label=f'Label: Drop ({sum(1 for _, t in self.labels if t == "DROP_OFF")})'),
+                Line2D([0], [0], marker='x', color='gray', linestyle='', markersize=6, label=f'Rejected ({len(self.rejected_candidates)})'),
             ]
-            self.ax_timeline.legend(handles=legend_elements, loc='upper right', fontsize=7)
+            self.ax_timeline.legend(handles=legend_elements, loc='upper right', fontsize=6)
+
+            # Edge signal legend
+            if self.edge_signal:
+                self.ax_edge.legend(loc='upper right', fontsize=6)
 
             # Initialize zoom to show 2000 frames (default view)
             if self.timeline_xlim is None:
@@ -1042,9 +1158,10 @@ class InteractiveTuner:
                         new_xmin = max(0, new_xmax - window)
                     self.timeline_xlim = [new_xmin, new_xmax]
 
-            # Apply the xlim
+            # Apply the xlim to BOTH plots (timeline and edge)
             if self.timeline_xlim is not None:
                 self.ax_timeline.set_xlim(self.timeline_xlim)
+                self.ax_edge.set_xlim(self.timeline_xlim)  # Sync zoom between plots
 
         # Update status text
         if self.current_frame < len(self.depth_history):
@@ -1080,14 +1197,29 @@ class InteractiveTuner:
             precision = (true_positives / n_predictions * 100) if n_predictions > 0 else 0
             recall = (true_positives / n_labels * 100) if n_labels > 0 else 0
 
+            # Filter statistics (NEW! - Visual Enhancement #2)
+            filter_stats_text = ""
+            if self.filter_stats:
+                stats = self.filter_stats
+                total_rejected = (stats.spike_rejected + stats.dwell_rejected +
+                                 stats.variance_rejected + stats.baseline_rejected +
+                                 stats.pre_stability_rejected + stats.twoway_baseline_rejected)
+                if total_rejected > 0:
+                    filter_stats_text = f"""
+=== Filter Statistics ===
+Total Rejected: {total_rejected}
+  Spike: {stats.spike_rejected} | Dwell: {stats.dwell_rejected}
+  Variance: {stats.variance_rejected} | Baseline: {stats.baseline_rejected}
+  Pre-Stab: {stats.pre_stability_rejected} | 2Way: {stats.twoway_baseline_rejected}
+"""
+
             status = f"""{frame_info}
 Depth: {depth_val:.2f}m
 
 === Predictions vs Labels ===
 Predictions: {n_predictions} | Labels: {n_labels}
 True Pos: {true_positives} | False Pos: {false_positives} | Missed: {missed}
-Precision: {precision:.0f}% | Recall: {recall:.0f}%
-
+Precision: {precision:.0f}% | Recall: {recall:.0f}%{filter_stats_text}
 Controls: p=pick-up, d=drop-off, c=clear, s=save
 """
             self.status_text.set_text(status)

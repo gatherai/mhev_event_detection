@@ -230,150 +230,156 @@ class InteractiveTuner:
         self.last_label_move_time = 0
         self.label_move_cooldown = 0.15  # 150ms minimum between moves
 
-        # Slider area - Core parameters only (space saving!)
-        slider_height = 0.022
-        slider_spacing = 0.035
+        # ALL parameters as compact TextBox fields (space saving!)
+        # Use 3 columns for better organization
+        textbox_height = 0.018
+        textbox_spacing = 0.022
+        textbox_width = 0.055
+        label_width = 0.08
 
-        # Core detection parameters (keep as sliders for easy tuning)
-        core_sliders = [
-            ('min_edge_strength_m', 'Edge Strength (m)', 0.1, 1.0, None),
-            ('window_size', 'Window (frames)', 5, 30, None),
-            ('smoothing_window', 'Smoothing', 1, 15, None),
-            ('min_event_gap_frames', 'Event Gap (f)', 10, 100, None),
-            ('min_valid_pixels_pct', 'Valid Px (%)', 5, 50, None),
-            ('max_event_distance_m', 'Max Dist (m)', 0.5, 5.0, None),
+        # Column 1: Core detection parameters
+        col1_params = [
+            ('min_edge_strength_m', 'EdgeStr'),
+            ('window_size', 'Window'),
+            ('smoothing_window', 'Smooth'),
+            ('min_event_gap_frames', 'EvtGap'),
+            ('min_valid_pixels_pct', 'ValidPx'),
+            ('max_event_distance_m', 'MaxDist'),
         ]
 
-        self.sliders = {}
-
-        # Create core parameter sliders (left side)
-        slider_x = 0.08
-        slider_width = 0.25
-        for i, (param, label, vmin, vmax, valstep) in enumerate(core_sliders):
-            ax = self.fig.add_axes([slider_x, 0.40 - i * slider_spacing, slider_width, slider_height])
-            initial_val = getattr(self.config, param, vmin)
-            if isinstance(initial_val, bool):
-                initial_val = 1 if initial_val else 0
-            slider = Slider(ax, label, vmin, vmax, valinit=initial_val, valstep=valstep)
-            slider.on_changed(self._make_slider_callback(param))
-            self.sliders[param] = slider
-
-        # Filter parameters as compact TextBox fields (right side) - SPACE SAVING!
-        filter_params_y_start = 0.43
-        textbox_height = 0.02
-        textbox_spacing = 0.025
-        textbox_x = 0.38
-        label_x = 0.35
-        textbox_width = 0.06
-
-        filter_params = [
+        # Column 2: Filter enable/disable + main params
+        col2_params = [
             ('enable_spike_filter', 'Spike'),
-            ('spike_reject_window_frames', 'Spike Win'),
+            ('spike_reject_window_frames', 'SpikeWin'),
             ('enable_dwell_filter', 'Dwell'),
-            ('min_dwell_frames', 'Dwell Fr'),
-            ('dwell_tolerance_m', 'Dwell Tol'),
+            ('min_dwell_frames', 'DwellFr'),
+            ('dwell_tolerance_m', 'DwellTol'),
             ('enable_variance_filter', 'Variance'),
-            ('max_event_variance_m2', 'Max Var'),
+            ('max_event_variance_m2', 'MaxVar'),
             ('enable_baseline_filter', 'Baseline'),
-            ('baseline_check_frames', 'Base Fr'),
-            ('baseline_return_threshold_m', 'Base Thr'),
-            ('enable_pre_stability_filter', 'PreStab'),
-            ('pre_event_check_frames', 'PreStab Fr'),
-            ('max_pre_event_variance_m2', 'PreVar'),
-            ('min_nan_block_for_stability', 'NaN Blk'),
-            ('max_state_transitions', 'MaxTrans'),
-            ('enable_twoway_baseline_filter', '2Way Base'),
         ]
 
-        self.filter_textboxes = {}
+        # Column 3: Advanced filter parameters
+        col3_params = [
+            ('baseline_check_frames', 'BaseFr'),
+            ('baseline_return_threshold_m', 'BaseThr'),
+            ('enable_pre_stability_filter', 'PreStab'),
+            ('pre_event_check_frames', 'PreStabFr'),
+            ('max_pre_event_variance_m2', 'PreVar'),
+            ('min_nan_block_for_stability', 'NaNBlk'),
+            ('max_state_transitions', 'MaxTran'),
+            ('enable_twoway_baseline_filter', '2WayBase'),
+        ]
 
-        for i, (param, label) in enumerate(filter_params):
-            # Add label
-            ax_label = self.fig.add_axes([label_x, filter_params_y_start - i * textbox_spacing, 0.02, textbox_height])
-            ax_label.axis('off')
-            ax_label.text(0, 0.5, label + ':', fontsize=7, ha='right', va='center')
+        self.param_textboxes = {}
+        params_y_start = 0.44
 
-            # Add textbox
-            ax = self.fig.add_axes([textbox_x, filter_params_y_start - i * textbox_spacing, textbox_width, textbox_height])
-            initial_val = getattr(self.config, param)
-            if isinstance(initial_val, bool):
-                initial_val = '1' if initial_val else '0'
-            else:
-                initial_val = str(initial_val)
+        # Helper function to create textbox column
+        def create_textbox_column(params, label_x, textbox_x):
+            for i, (param, label) in enumerate(params):
+                y_pos = params_y_start - i * textbox_spacing
 
-            textbox = TextBox(ax, '', initial=initial_val, color='lightgray', hovercolor='lightyellow')
-            textbox.on_submit(self._make_textbox_callback(param))
-            self.filter_textboxes[param] = textbox
+                # Add label
+                ax_label = self.fig.add_axes([label_x, y_pos, label_width, textbox_height])
+                ax_label.axis('off')
+                ax_label.text(0.95, 0.5, label + ':', fontsize=7, ha='right', va='center')
+
+                # Add textbox
+                ax = self.fig.add_axes([textbox_x, y_pos, textbox_width, textbox_height])
+                initial_val = getattr(self.config, param)
+                if isinstance(initial_val, bool):
+                    initial_val = '1' if initial_val else '0'
+                else:
+                    initial_val = str(initial_val)
+
+                textbox = TextBox(ax, '', initial=initial_val, color='lightgray', hovercolor='lightyellow')
+                textbox.on_submit(self._make_textbox_callback(param))
+                self.param_textboxes[param] = textbox
+
+        # Create three columns
+        create_textbox_column(col1_params, 0.06, 0.14)   # Column 1
+        create_textbox_column(col2_params, 0.22, 0.30)   # Column 2
+        create_textbox_column(col3_params, 0.38, 0.46)   # Column 3
+
+        # Keep old references for compatibility
+        self.sliders = {}
+        self.filter_textboxes = self.param_textboxes
 
         # Frame slider and textbox
-        ax_frame = self.fig.add_axes([0.55, 0.35, 0.25, slider_height])
+        frame_widget_height = 0.018
+        ax_frame = self.fig.add_axes([0.55, 0.40, 0.25, frame_widget_height])
         self.frame_slider = Slider(ax_frame, 'Frame', 0, max(1, len(self.reader) - 1),
                                    valinit=0, valstep=1)
         self.frame_slider.on_changed(self._on_frame_change)
 
         # Frame number text input
-        ax_frame_text = self.fig.add_axes([0.81, 0.35, 0.08, slider_height])
+        ax_frame_text = self.fig.add_axes([0.81, 0.40, 0.08, frame_widget_height])
         total_frames = len(self.reader)
         self.frame_textbox = TextBox(ax_frame_text, '', initial=f'0 / {total_frames-1}')
         self.frame_textbox.on_submit(self._on_frame_text_submit)
 
-        # Buttons
-        ax_play = self.fig.add_axes([0.55, 0.28, 0.08, 0.04])
+        # Buttons - reorganized and more compact
+        btn_height = 0.03
+        btn_y_row1 = 0.35
+        btn_y_row2 = 0.31
+        btn_y_row3 = 0.27
+
+        # Row 1: Playback controls
+        ax_play = self.fig.add_axes([0.55, btn_y_row1, 0.08, btn_height])
         self.btn_play = Button(ax_play, 'Play (1x)')
         self.btn_play.on_clicked(self._toggle_play)
 
         # Speed buttons
-        ax_speed_1x = self.fig.add_axes([0.64, 0.28, 0.04, 0.04])
+        ax_speed_1x = self.fig.add_axes([0.64, btn_y_row1, 0.04, btn_height])
         self.btn_speed_1x = Button(ax_speed_1x, '1x', color='lightgreen')
         self.btn_speed_1x.on_clicked(lambda e: self._set_speed(1))
 
-        ax_speed_2x = self.fig.add_axes([0.685, 0.28, 0.04, 0.04])
+        ax_speed_2x = self.fig.add_axes([0.685, btn_y_row1, 0.04, btn_height])
         self.btn_speed_2x = Button(ax_speed_2x, '2x')
         self.btn_speed_2x.on_clicked(lambda e: self._set_speed(2))
 
-        ax_speed_5x = self.fig.add_axes([0.73, 0.28, 0.04, 0.04])
+        ax_speed_5x = self.fig.add_axes([0.73, btn_y_row1, 0.04, btn_height])
         self.btn_speed_5x = Button(ax_speed_5x, '5x')
         self.btn_speed_5x.on_clicked(lambda e: self._set_speed(5))
 
-        ax_speed_10x = self.fig.add_axes([0.775, 0.28, 0.05, 0.04])
+        ax_speed_10x = self.fig.add_axes([0.775, btn_y_row1, 0.05, btn_height])
         self.btn_speed_10x = Button(ax_speed_10x, '10x')
         self.btn_speed_10x.on_clicked(lambda e: self._set_speed(10))
 
-        ax_reset = self.fig.add_axes([0.83, 0.28, 0.06, 0.04])
+        ax_reset = self.fig.add_axes([0.83, btn_y_row1, 0.06, btn_height])
         self.btn_reset = Button(ax_reset, 'Reset')
         self.btn_reset.on_clicked(self._reset_detector)
 
-        # Move save button down
-        ax_save = self.fig.add_axes([0.83, 0.22, 0.06, 0.04])
+        # Row 2: Labeling buttons
+        ax_pickup = self.fig.add_axes([0.55, btn_y_row2, 0.1, btn_height])
+        self.btn_pickup = Button(ax_pickup, 'Pick [p]', color='lightgreen')
+        self.btn_pickup.on_clicked(self._mark_pickup)
+
+        ax_dropoff = self.fig.add_axes([0.66, btn_y_row2, 0.1, btn_height])
+        self.btn_dropoff = Button(ax_dropoff, 'Drop [d]', color='lightsalmon')
+        self.btn_dropoff.on_clicked(self._mark_dropoff)
+
+        ax_clear = self.fig.add_axes([0.77, btn_y_row2, 0.06, btn_height])
+        self.btn_clear = Button(ax_clear, 'Clear', color='lightgray')
+        self.btn_clear.on_clicked(self._clear_label)
+
+        ax_save = self.fig.add_axes([0.84, btn_y_row2, 0.05, btn_height])
         self.btn_save = Button(ax_save, 'Save')
         self.btn_save.on_clicked(self._save_config)
 
-        # Event navigation buttons
-        ax_prev_event = self.fig.add_axes([0.55, 0.16, 0.13, 0.04])
-        self.btn_prev_event = Button(ax_prev_event, '<< Prev Event [,]', color='lightblue')
+        # Row 3: Event navigation buttons
+        ax_prev_event = self.fig.add_axes([0.55, btn_y_row3, 0.13, btn_height])
+        self.btn_prev_event = Button(ax_prev_event, '<< Prev [,]', color='lightblue')
         self.btn_prev_event.on_clicked(self._goto_prev_event)
 
-        ax_next_event = self.fig.add_axes([0.69, 0.16, 0.13, 0.04])
-        self.btn_next_event = Button(ax_next_event, 'Next Event [.] >>', color='lightblue')
+        ax_next_event = self.fig.add_axes([0.69, btn_y_row3, 0.13, btn_height])
+        self.btn_next_event = Button(ax_next_event, 'Next [.] >>', color='lightblue')
         self.btn_next_event.on_clicked(self._goto_next_event)
 
-        # Labeling buttons
-        ax_pickup = self.fig.add_axes([0.55, 0.22, 0.1, 0.04])
-        self.btn_pickup = Button(ax_pickup, 'Pick-up [p]', color='lightgreen')
-        self.btn_pickup.on_clicked(self._mark_pickup)
-
-        ax_dropoff = self.fig.add_axes([0.66, 0.22, 0.1, 0.04])
-        self.btn_dropoff = Button(ax_dropoff, 'Drop-off [d]', color='lightsalmon')
-        self.btn_dropoff.on_clicked(self._mark_dropoff)
-
-        ax_clear = self.fig.add_axes([0.77, 0.22, 0.1, 0.04])
-        self.btn_clear = Button(ax_clear, 'Clear [c]', color='lightgray')
-        self.btn_clear.on_clicked(self._clear_label)
-
-        # Status text (bottom right, below buttons)
-        self.ax_status = self.fig.add_axes([0.55, 0.02, 0.4, 0.12])
+        # Status text (bottom right, below buttons) - MORE SPACE
+        self.ax_status = self.fig.add_axes([0.55, 0.02, 0.4, 0.23])
         self.ax_status.axis('off')
-        self.status_text = self.ax_status.text(0, 0.95, '', fontsize=8,
+        self.status_text = self.ax_status.text(0, 1.0, '', fontsize=7,
                                                 verticalalignment='top',
                                                 family='monospace')
 

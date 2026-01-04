@@ -24,6 +24,11 @@ class PalletEvent:
     edge_strength: float       # Magnitude of depth change
     depth_m: float             # Current median depth
     frame_idx: int
+    filter_results: dict = None  # Track which filters this event passed/failed
+
+    def __post_init__(self):
+        if self.filter_results is None:
+            self.filter_results = {}
 
 
 @dataclass
@@ -415,29 +420,51 @@ class EdgeDetector:
         c = self.config
         n_frames = len(smoothed_depths)
 
+        # Initialize all events as passing edge detection
+        for event in events:
+            event.filter_results['edge_detection'] = 'PASS'
+
         # Filter 1: Spike detection (PICK_UP→DROP_OFF pairs within short window)
         if c.enable_spike_filter:
             events = self._filter_spikes(events)
+        else:
+            for event in events:
+                event.filter_results['spike'] = 'SKIP'
 
         # Filter 2: Variance check (reject high variance = curved person)
         if c.enable_variance_filter:
             events = self._filter_by_variance(events, variances)
+        else:
+            for event in events:
+                event.filter_results['variance'] = 'SKIP'
 
         # Filter 3: Dwell time check (new depth must persist)
         if c.enable_dwell_filter:
             events = self._filter_by_dwell(events, smoothed_depths, n_frames)
+        else:
+            for event in events:
+                event.filter_results['dwell'] = 'SKIP'
 
         # Filter 4: Baseline return check (reject if depth returns to original)
         if c.enable_baseline_filter:
             events = self._filter_by_baseline_return(events, smoothed_depths, n_frames)
+        else:
+            for event in events:
+                event.filter_results['baseline'] = 'SKIP'
 
         # Filter 5: Pre-event stability check (reject if depth unstable before event)
         if c.enable_pre_stability_filter:
             events = self._filter_by_pre_stability(events, smoothed_depths, n_frames)
+        else:
+            for event in events:
+                event.filter_results['pre_stability'] = 'SKIP'
 
         # Filter 6: Two-way baseline check (reject if depth_before ≈ depth_after)
         if c.enable_twoway_baseline_filter:
             events = self._filter_by_twoway_baseline(events, smoothed_depths, n_frames)
+        else:
+            for event in events:
+                event.filter_results['twoway_baseline'] = 'SKIP'
 
         return events
 
@@ -449,6 +476,8 @@ class EdgeDetector:
         If these happen within spike_reject_window_frames, reject both.
         """
         if len(events) < 2:
+            for event in events:
+                event.filter_results['spike'] = 'PASS'
             return events
 
         c = self.config
@@ -467,10 +496,13 @@ class EdgeDetector:
 
                 if gap <= c.spike_reject_window_frames:
                     # This is a spike (quick PICK_UP→DROP_OFF) - reject both
+                    event.filter_results['spike'] = 'FAIL'
+                    events[i + 1].filter_results['spike'] = 'FAIL'
                     self.filter_stats.spike_rejected += 2
                     i += 2  # Skip both events
                     continue
 
+            event.filter_results['spike'] = 'PASS'
             filtered.append(event)
             i += 1
 
@@ -498,14 +530,17 @@ class EdgeDetector:
 
             if len(valid_vars) == 0:
                 # No valid variance data, keep the event
+                event.filter_results['variance'] = 'PASS'
                 filtered.append(event)
                 continue
 
             mean_variance = np.mean(valid_vars)
 
             if mean_variance <= c.max_event_variance_m2:
+                event.filter_results['variance'] = 'PASS'
                 filtered.append(event)
             else:
+                event.filter_results['variance'] = 'FAIL'
                 self.filter_stats.variance_rejected += 1
 
         return filtered
@@ -529,6 +564,7 @@ class EdgeDetector:
             dwell_end = min(n_frames, idx + c.min_dwell_frames)
             if dwell_end <= idx:
                 # Not enough frames after event, keep it
+                event.filter_results['dwell'] = 'PASS'
                 filtered.append(event)
                 continue
 
@@ -536,6 +572,7 @@ class EdgeDetector:
             valid_depths = post_depths[~np.isnan(post_depths)]
 
             if len(valid_depths) == 0:
+                event.filter_results['dwell'] = 'PASS'
                 filtered.append(event)
                 continue
 
@@ -544,8 +581,10 @@ class EdgeDetector:
             dwell_ratio = np.sum(within_tolerance) / len(valid_depths)
 
             if dwell_ratio >= 0.7:  # At least 70% of frames within tolerance
+                event.filter_results['dwell'] = 'PASS'
                 filtered.append(event)
             else:
+                event.filter_results['dwell'] = 'FAIL'
                 self.filter_stats.dwell_rejected += 1
 
         return filtered
@@ -569,6 +608,7 @@ class EdgeDetector:
             baseline_start = max(0, idx - w - c.window_size)
             baseline_end = max(0, idx - w)
             if baseline_end <= baseline_start:
+                event.filter_results['baseline'] = 'PASS'
                 filtered.append(event)
                 continue
 
@@ -576,6 +616,7 @@ class EdgeDetector:
             valid_baseline = baseline_depths[~np.isnan(baseline_depths)]
 
             if len(valid_baseline) == 0:
+                event.filter_results['baseline'] = 'PASS'
                 filtered.append(event)
                 continue
 
@@ -587,6 +628,7 @@ class EdgeDetector:
 
             if check_end <= check_start:
                 # Not enough frames to check, keep event
+                event.filter_results['baseline'] = 'PASS'
                 filtered.append(event)
                 continue
 
@@ -594,6 +636,7 @@ class EdgeDetector:
             valid_post = post_depths[~np.isnan(post_depths)]
 
             if len(valid_post) == 0:
+                event.filter_results['baseline'] = 'PASS'
                 filtered.append(event)
                 continue
 
@@ -603,8 +646,10 @@ class EdgeDetector:
             returned_to_baseline = abs(post_event_depth - pre_event_depth) <= c.baseline_return_threshold_m
 
             if not returned_to_baseline:
+                event.filter_results['baseline'] = 'PASS'
                 filtered.append(event)
             else:
+                event.filter_results['baseline'] = 'FAIL'
                 self.filter_stats.baseline_rejected += 1
 
         return filtered
@@ -688,6 +733,7 @@ class EdgeDetector:
 
             if pre_end <= pre_start:
                 # Not enough frames before event, keep it
+                event.filter_results['pre_stability'] = 'PASS'
                 filtered.append(event)
                 continue
 
@@ -697,8 +743,10 @@ class EdgeDetector:
             is_stable = self._is_window_stable(pre_window, c)
 
             if is_stable:
+                event.filter_results['pre_stability'] = 'PASS'
                 filtered.append(event)
             else:
+                event.filter_results['pre_stability'] = 'FAIL'
                 self.filter_stats.pre_stability_rejected += 1
 
         return filtered
@@ -755,6 +803,7 @@ class EdgeDetector:
 
             # Need enough frames on both sides
             if before_end <= before_start or after_end <= after_start:
+                event.filter_results['twoway_baseline'] = 'PASS'
                 filtered.append(event)
                 continue
 
@@ -780,8 +829,10 @@ class EdgeDetector:
             # else: one NaN, one valid → state changed → real event
 
             if state_returned:
+                event.filter_results['twoway_baseline'] = 'FAIL'
                 self.filter_stats.twoway_baseline_rejected += 1
             else:
+                event.filter_results['twoway_baseline'] = 'PASS'
                 filtered.append(event)
 
         return filtered

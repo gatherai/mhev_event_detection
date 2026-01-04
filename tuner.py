@@ -1071,13 +1071,27 @@ class InteractiveTuner:
                 self.ax_edge.axhline(y=-self.config.min_edge_strength_m, color='red', linestyle='--', alpha=0.5, linewidth=1)
 
             # Mark REJECTED candidates (NEW! - Visual Enhancement #4)
+            # Show which filter rejected each candidate
             for event in self.rejected_candidates:
                 frame_idx = event.frame_idx
                 edge_val = self.edge_signal[frame_idx] if frame_idx < len(self.edge_signal) else 0
 
-                # Mark on edge signal plot
+                # Find which filter rejected this event
+                reject_reason = "?"
+                if event.filter_results:
+                    for filter_name, result in event.filter_results.items():
+                        if result == 'FAIL':
+                            reject_reason = filter_name[:4].upper()  # Abbreviate (e.g., "SPIK", "DWELL")
+                            break
+
+                # Mark on edge signal plot with rejection reason
                 self.ax_edge.plot(frame_idx, edge_val, 'x', color='gray', markersize=8,
                                 markeredgewidth=2, alpha=0.6, zorder=3)
+                # Annotate rejection reason
+                self.ax_edge.annotate(reject_reason, xy=(frame_idx, edge_val),
+                                    xytext=(0, -12), textcoords='offset points',
+                                    fontsize=5, color='gray', alpha=0.7,
+                                    ha='center', style='italic')
 
                 # Mark on timeline
                 depth_at_frame = self.depth_history[frame_idx] if frame_idx < len(self.depth_history) else 0
@@ -1177,6 +1191,9 @@ class InteractiveTuner:
             current_label = next((t for f, t in self.labels if f == self.current_frame), None)
             current_pred = next((t for f, t in self.event_markers if f == self.current_frame), None)
 
+            # Get event object for filter results
+            current_event_obj = next((e for e in self.event_objects if e.frame_idx == self.current_frame), None)
+
             frame_info = f"Frame: {self.current_frame} / {len(self.reader) - 1}"
             if current_label:
                 frame_info += f" [LABEL: {current_label}]"
@@ -1203,6 +1220,56 @@ class InteractiveTuner:
             precision = (true_positives / n_predictions * 100) if n_predictions > 0 else 0
             recall = (true_positives / n_labels * 100) if n_labels > 0 else 0
 
+            # Current Event Filter Results (NEW! - Show pass/fail for each filter)
+            event_filter_text = ""
+            filter_symbols = {
+                'PASS': '✓',
+                'FAIL': '✗',
+                'SKIP': '-'
+            }
+
+            if current_event_obj and current_event_obj.filter_results:
+                results = current_event_obj.filter_results
+                event_filter_text = f"""
+=== Detected Event Filters ===
+Edge: {filter_symbols.get(results.get('edge_detection', 'N/A'), '?')} | Spike: {filter_symbols.get(results.get('spike', 'N/A'), '?')} | Var: {filter_symbols.get(results.get('variance', 'N/A'), '?')} | Dwell: {filter_symbols.get(results.get('dwell', 'N/A'), '?')}
+Base: {filter_symbols.get(results.get('baseline', 'N/A'), '?')} | PreStab: {filter_symbols.get(results.get('pre_stability', 'N/A'), '?')} | 2Way: {filter_symbols.get(results.get('twoway_baseline', 'N/A'), '?')}
+"""
+            elif current_label:
+                # For ground truth labels, find nearest detected/rejected event
+                tolerance = 50
+                nearby_events = [e for e in self.event_objects if abs(e.frame_idx - self.current_frame) <= tolerance]
+                nearby_rejected = [e for e in self.rejected_candidates if abs(e.frame_idx - self.current_frame) <= tolerance]
+
+                if nearby_events:
+                    nearest = min(nearby_events, key=lambda e: abs(e.frame_idx - self.current_frame))
+                    offset = nearest.frame_idx - self.current_frame
+                    results = nearest.filter_results
+                    event_filter_text = f"""
+=== Ground Truth Label ===
+Nearest Detection: {offset:+d} frames away
+Edge: {filter_symbols.get(results.get('edge_detection', 'N/A'), '?')} | Spike: {filter_symbols.get(results.get('spike', 'N/A'), '?')} | Var: {filter_symbols.get(results.get('variance', 'N/A'), '?')} | Dwell: {filter_symbols.get(results.get('dwell', 'N/A'), '?')}
+Base: {filter_symbols.get(results.get('baseline', 'N/A'), '?')} | PreStab: {filter_symbols.get(results.get('pre_stability', 'N/A'), '?')} | 2Way: {filter_symbols.get(results.get('twoway_baseline', 'N/A'), '?')}
+"""
+                elif nearby_rejected:
+                    nearest = min(nearby_rejected, key=lambda e: abs(e.frame_idx - self.current_frame))
+                    offset = nearest.frame_idx - self.current_frame
+                    results = nearest.filter_results
+                    # Find which filter failed
+                    failed_filter = next((name for name, result in results.items() if result == 'FAIL'), 'Unknown')
+                    event_filter_text = f"""
+=== Ground Truth Label ===
+Event REJECTED ({offset:+d} frames) - Failed: {failed_filter.upper()}
+Edge: {filter_symbols.get(results.get('edge_detection', 'N/A'), '?')} | Spike: {filter_symbols.get(results.get('spike', 'N/A'), '?')} | Var: {filter_symbols.get(results.get('variance', 'N/A'), '?')} | Dwell: {filter_symbols.get(results.get('dwell', 'N/A'), '?')}
+Base: {filter_symbols.get(results.get('baseline', 'N/A'), '?')} | PreStab: {filter_symbols.get(results.get('pre_stability', 'N/A'), '?')} | 2Way: {filter_symbols.get(results.get('twoway_baseline', 'N/A'), '?')}
+"""
+                else:
+                    event_filter_text = f"""
+=== Ground Truth Label ===
+NO EVENT DETECTED within {tolerance} frames
+Possible reasons: edge too weak, or all filters rejected it
+"""
+
             # Filter statistics (NEW! - Visual Enhancement #2)
             filter_stats_text = ""
             if self.filter_stats:
@@ -1212,7 +1279,7 @@ class InteractiveTuner:
                                  stats.pre_stability_rejected + stats.twoway_baseline_rejected)
                 if total_rejected > 0:
                     filter_stats_text = f"""
-=== Filter Statistics ===
+=== Overall Filter Stats ===
 Total Rejected: {total_rejected}
   Spike: {stats.spike_rejected} | Dwell: {stats.dwell_rejected}
   Variance: {stats.variance_rejected} | Baseline: {stats.baseline_rejected}
@@ -1221,7 +1288,7 @@ Total Rejected: {total_rejected}
 
             status = f"""{frame_info}
 Depth: {depth_val:.2f}m
-
+{event_filter_text}
 === Predictions vs Labels ===
 Predictions: {n_predictions} | Labels: {n_labels}
 True Pos: {true_positives} | False Pos: {false_positives} | Missed: {missed}

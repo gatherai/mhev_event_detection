@@ -8,6 +8,12 @@ MHE-V (Material Handling Equipment Vision) pallet pick/drop event detection usin
 
 **Status:** Algorithm under active development.
 
+## Documentation
+
+- **[WORKFLOW.md](WORKFLOW.md)** - Step-by-step guide for labeling, tuning, and debugging ⭐
+- **[README.md](README.md)** - Project overview and quick start
+- **[algorithm_design.md](algorithm_design.md)** - Algorithm design notes
+
 ## Commands
 
 ```bash

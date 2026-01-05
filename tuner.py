@@ -245,6 +245,8 @@ class InteractiveTuner:
             ('min_event_gap_frames', 'EvtGap'),
             ('min_valid_pixels_pct', 'ValidPx'),
             ('max_event_distance_m', 'MaxDist'),
+            ('min_consecutive_valid_frames', 'MinValid'),
+            ('min_consecutive_nan_frames', 'MinNaN'),
         ]
 
         # Column 2: Filter enable/disable + main params
@@ -436,7 +438,8 @@ class InteractiveTuner:
                 # Integer parameters
                 if param in ['smoothing_window', 'window_size', 'min_event_gap_frames',
                             'spike_reject_window_frames', 'min_dwell_frames', 'baseline_check_frames',
-                            'pre_event_check_frames', 'min_nan_block_for_stability', 'max_state_transitions']:
+                            'pre_event_check_frames', 'min_nan_block_for_stability', 'max_state_transitions',
+                            'min_consecutive_valid_frames', 'min_consecutive_nan_frames']:
                     val = int(float(text))  # Allow "10.0" -> 10
                 # Boolean parameters (0=False, 1=True)
                 elif param in ['enable_spike_filter', 'enable_dwell_filter',

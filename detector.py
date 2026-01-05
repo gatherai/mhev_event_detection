@@ -65,6 +65,10 @@ class DetectorConfig:
     min_valid_pixels_pct: float = 10.0 # Minimum valid pixels to use frame
     max_event_distance_m: float = 5.0  # Only detect events when depth <= this (forklift must be close)
 
+    # Spurious reading filter
+    min_consecutive_valid_frames: int = 5   # Remove valid readings shorter than this (surrounded by NaN)
+    min_consecutive_nan_frames: int = 5     # Remove NaN blocks shorter than this (surrounded by valid)
+
     frame_rate_hz: float = 10.0
 
     # Anti-false-positive filters (for transient occlusions like people walking through)
@@ -118,6 +122,8 @@ class DetectorConfig:
             "min_event_gap_frames": self.min_event_gap_frames,
             "min_valid_pixels_pct": self.min_valid_pixels_pct,
             "max_event_distance_m": self.max_event_distance_m,
+            "min_consecutive_valid_frames": self.min_consecutive_valid_frames,
+            "min_consecutive_nan_frames": self.min_consecutive_nan_frames,
             "frame_rate_hz": self.frame_rate_hz,
             # Anti-false-positive filter settings
             "spike_reject_window_frames": self.spike_reject_window_frames,
@@ -147,7 +153,8 @@ class DetectorConfig:
 
         for key in ["min_depth_m", "max_depth_m", "window_size", "min_edge_strength_m",
                     "smoothing_window", "min_event_gap_frames", "min_valid_pixels_pct",
-                    "max_event_distance_m", "frame_rate_hz",
+                    "max_event_distance_m", "min_consecutive_valid_frames", "min_consecutive_nan_frames",
+                    "frame_rate_hz",
                     # Anti-false-positive filter settings
                     "spike_reject_window_frames", "enable_spike_filter",
                     "min_dwell_frames", "dwell_tolerance_m", "enable_dwell_filter",
@@ -249,17 +256,20 @@ class EdgeDetector:
         depths = np.array(depths)
         variances = np.array(variances)
 
-        # Step 2: Interpolate NaN values for continuity
+        # Step 2: Filter spurious readings (brief valid readings between NaNs, or vice versa)
+        depths = self._filter_spurious_readings(depths)
+
+        # Step 3: Interpolate NaN values for continuity
         depths_interp = self._interpolate_nans(depths)
 
-        # Step 3: Smooth the depth signal
+        # Step 4: Smooth the depth signal
         if c.smoothing_window > 1:
             kernel = np.ones(c.smoothing_window) / c.smoothing_window
             smoothed = np.convolve(depths_interp, kernel, mode='same')
         else:
             smoothed = depths_interp
 
-        # Step 4: Compute edge signal (after - before)
+        # Step 5: Compute edge signal (after - before)
         edge_signal = np.zeros(n_frames)
         w = c.window_size
 
@@ -269,10 +279,10 @@ class EdgeDetector:
             if not np.isnan(before) and not np.isnan(after):
                 edge_signal[i] = after - before
 
-        # Step 5: Find events (peaks in edge signal)
+        # Step 6: Find events (peaks in edge signal)
         events_before_filters = self._find_events(edge_signal, smoothed)
 
-        # Step 6: Apply anti-false-positive filters
+        # Step 7: Apply anti-false-positive filters
         events = self._apply_filters(events_before_filters, smoothed, variances)
 
         # Prepare diagnostics
@@ -289,6 +299,69 @@ class EdgeDetector:
             }
 
         return depths.tolist(), events, diagnostics
+
+    def _filter_spurious_readings(self, depths: np.ndarray) -> np.ndarray:
+        """
+        Filter out spurious readings: brief valid readings between NaNs, or brief NaN blocks between valid.
+
+        NaN is signal (often means pallet blocking sensor), so spurious valid readings
+        that appear briefly between NaN blocks should be removed.
+        """
+        c = self.config
+        result = depths.copy()
+        n = len(result)
+
+        # Identify state (NaN or valid) for each frame
+        is_nan = np.isnan(result)
+
+        # Filter 1: Remove brief valid islands surrounded by NaNs
+        if c.min_consecutive_valid_frames > 0:
+            i = 0
+            while i < n:
+                if not is_nan[i]:  # Start of valid block
+                    # Find end of this valid block
+                    j = i
+                    while j < n and not is_nan[j]:
+                        j += 1
+
+                    block_length = j - i
+
+                    # If block is too short, replace with NaN
+                    if block_length < c.min_consecutive_valid_frames:
+                        result[i:j] = np.nan
+
+                    i = j
+                else:
+                    i += 1
+
+        # Filter 2: Remove brief NaN islands surrounded by valid readings
+        # (Optional - may help with sensor glitches)
+        if c.min_consecutive_nan_frames > 0:
+            is_nan = np.isnan(result)  # Recompute after first filter
+            i = 0
+            while i < n:
+                if is_nan[i]:  # Start of NaN block
+                    # Find end of this NaN block
+                    j = i
+                    while j < n and is_nan[j]:
+                        j += 1
+
+                    block_length = j - i
+
+                    # If NaN block is too short and surrounded by valid, interpolate
+                    if block_length < c.min_consecutive_nan_frames:
+                        # Only fill if we have valid data on both sides
+                        if i > 0 and j < n and not np.isnan(result[i-1]) and not np.isnan(result[j]):
+                            # Linear interpolation across the gap
+                            for k in range(i, j):
+                                alpha = (k - i + 1) / (j - i + 1)
+                                result[k] = result[i-1] * (1 - alpha) + result[j] * alpha
+
+                    i = j
+                else:
+                    i += 1
+
+        return result
 
     def _interpolate_nans(self, arr: np.ndarray) -> np.ndarray:
         """Interpolate NaN values in array."""

@@ -4,16 +4,32 @@ Automated pallet pick-up and drop-off detection using depth camera data for mate
 
 ## Quick Start
 
+### Installation
+
 ```bash
+# Clone repository
+git clone git@github.com:gatherai/mhev_event_detection.git
+cd mhev_event_detection
+
+# Create virtual environment (recommended)
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
 # Install dependencies
 pip install -r requirements.txt
+```
 
+### Running the Tuner
+
+```bash
 # Run interactive tuner
 python tuner.py bags/<depth_file>.mcap --rotate 90
 
 # Load with existing configuration
 python tuner.py bags/<file>.mcap --config <file>_config.json
 ```
+
+**Note:** MCAP data files are not included in the repository (too large). You'll need your own depth camera recordings.
 
 ## Documentation
 

@@ -14,12 +14,26 @@ MHE-V (Material Handling Equipment Vision) pallet pick/drop event detection usin
 - **[README.md](README.md)** - Project overview and quick start
 - **[algorithm_design.md](algorithm_design.md)** - Algorithm design notes
 
+## Installation
+
+```bash
+# Create virtual environment (recommended)
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+**Dependencies:**
+- `mcap>=1.1.0` - MCAP file reading
+- `mcap-ros2-support>=0.5.0` - ROS2 message decoding
+- `numpy>=1.24.0` - Array operations
+- `matplotlib>=3.7.0` - GUI and plotting
+
 ## Commands
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
 # Run interactive tuner
 python tuner.py bags/<depth_file>.mcap --rotate 90
 

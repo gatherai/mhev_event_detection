@@ -127,9 +127,39 @@ def merge_consecutive_same_type(events):
 4. **Same-type merging** eliminates duplicates (can't pick up twice without dropping)
 5. **Keep last** strategy captures the final action (actual engagement, not approach)
 
+### Spurious Reading Filter (Pre-Processing)
+
+**Added:** Filters out brief valid depth readings between NaN blocks before edge detection.
+
+**Problem:** NaN is signal (often means pallet blocking sensor). Brief valid depth readings (1-4 frames) between NaN blocks create false events.
+
+**Solution:**
+```python
+# Remove valid depth blocks shorter than threshold
+if valid_block_length < min_consecutive_valid_frames:
+    replace_with_nan(valid_block)
+
+# Optionally interpolate brief NaN gaps between valid readings
+if nan_block_length < min_consecutive_nan_frames:
+    interpolate_across_gap(nan_block)
+```
+
+**Parameters:**
+```
+min_consecutive_valid_frames: 5  # Remove valid readings shorter than 0.5 sec
+min_consecutive_nan_frames: 5    # Fill NaN gaps shorter than 0.5 sec
+```
+
+**Benefits:**
+- Eliminates false events from sensor noise/glitches
+- Preserves NaN signal (pallet blocking view)
+- Only processes sustained depth changes (real events)
+
 ### Anti-False-Positive Filters (Optional)
 
 For environments with pedestrian traffic (people walking in front of camera), additional filters are available. These are **OFF by default** since edge detection already handles most cases well.
+
+All filters track per-event pass/fail status for diagnostics.
 
 #### Filter 1: Spike Detection
 Rejects PICK_UP→DROP_OFF pairs that occur within a short window.
@@ -141,20 +171,11 @@ Rejects PICK_UP→DROP_OFF pairs that occur within a short window.
 If these happen within ~3 seconds, reject both as transient occlusion.
 
 ```
+enable_spike_filter: false
 spike_reject_window_frames: 30  # ~3 sec at 10Hz
 ```
 
-#### Filter 2: Baseline Return Check
-Rejects events where depth returns to pre-event level after the event.
-
-**Rationale:** Real pick-up/drop-off changes the depth permanently. If depth returns to original, it was a transient occlusion.
-
-```
-baseline_check_frames: 50        # Check 5 sec after event
-baseline_return_threshold_m: 0.2 # If within 0.2m of original, reject
-```
-
-#### Filter 3: Variance Check
+#### Filter 2: Variance Check
 Rejects events with high depth variance in the ROI.
 
 **Rationale:** Flat pallet surface has low variance (~0.01-0.02 m²). Curved person has higher variance.
@@ -162,17 +183,60 @@ Rejects events with high depth variance in the ROI.
 **Note:** Less reliable because DROP_OFF events naturally have higher variance during transition.
 
 ```
+enable_variance_filter: false
 max_event_variance_m2: 1.0  # Permissive to avoid false rejections
 ```
 
-#### Filter 4: Dwell Time Check
+#### Filter 3: Dwell Time Check
 Requires depth to stay stable after event.
 
 **Note:** Less effective with edge detection since the edge point is in the middle of the transition, not at the stable end state.
 
 ```
+enable_dwell_filter: false
 min_dwell_frames: 10        # ~1 sec at 10Hz
 dwell_tolerance_m: 0.5      # Permissive tolerance
+```
+
+#### Filter 4: Baseline Return Check
+Rejects events where depth returns to pre-event level after the event.
+
+**Rationale:** Real pick-up/drop-off changes the depth permanently. If depth returns to original, it was a transient occlusion.
+
+```
+enable_baseline_filter: false
+baseline_check_frames: 50        # Check 5 sec after event
+baseline_return_threshold_m: 0.2 # If within 0.2m of original, reject
+```
+
+#### Filter 5: Pre-Stability Check (NEW)
+Rejects events where depth was unstable before the event.
+
+**Rationale:** Real pallet events have stable depth beforehand (empty floor, then forklift approaches). People appearing suddenly have no pre-stability.
+
+Considers both valid depth stability AND long NaN blocks as stable states.
+
+```
+enable_pre_stability_filter: false
+pre_event_check_frames: 30          # Check ~3 sec before event
+max_pre_event_variance_m2: 0.05     # Max variance for stability
+min_nan_block_for_stability: 20     # Long NaN = stable state
+max_state_transitions: 3            # Max valid↔NaN transitions
+```
+
+#### Filter 6: Two-Way Baseline Check (NEW)
+Rejects events where state before ≈ state after (transient occlusion).
+
+**Rationale:**
+- Real pallet events: state changes permanently (before ≠ after)
+- Transient occlusions: state returns to original (before ≈ after)
+
+Compares states using both NaN vs valid and depth values.
+
+```
+enable_twoway_baseline_filter: false
+baseline_check_frames: 50            # Check window size
+baseline_return_threshold_m: 0.2     # Tolerance for "same depth"
 ```
 
 #### Recommended Filter Configuration
@@ -182,7 +246,9 @@ For environments with pedestrian traffic:
 | Filter | Recommended | Notes |
 |--------|-------------|-------|
 | Spike | **Enable** | Most effective for person walk-through |
-| Baseline Return | **Enable** | Good secondary check |
+| Pre-Stability | **Enable** | Catches sudden appearances |
+| Two-Way Baseline | **Enable** | Robust transient check |
+| Baseline Return | Enable | Good secondary check |
 | Variance | Disable | High false rejection rate |
 | Dwell | Disable | Not compatible with edge detection |
 
